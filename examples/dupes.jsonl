@@ -1,0 +1,4 @@
+{"messages": [{"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "Paris."}]}
+{"messages": [{"role": "user", "content": "Name a primary color."}, {"role": "assistant", "content": "Blue."}]}
+{"messages": [{"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "Paris."}]}
+{"messages": [{"role": "user", "content": "what  is the capital of France?"}, {"role": "assistant", "content": "Paris."}]}

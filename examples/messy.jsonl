@@ -1,0 +1,8 @@
+{"messages": [{"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "Paris."}]}
+{"messages": [{"role": "user", "content": "This line was truncated while exporting
+{"messages": [{"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "Paris."}]}
+{"messages": [{"role": "user", "content": "Say hello."}, {"role": "user", "content": "Are you there?"}]}
+{"messages": [{"role": "human", "content": "Hi"}, {"role": "assistant", "content": "Hello!"}]}
+{"messages": [{"role": "user", "content": "Say nothing."}, {"role": "assistant", "content": ""}]}
+{"messages": [{"role": "user", "content": "what  is the capital of France?"}, {"role": "assistant", "content": "Paris."}]}
+{"prompt": "Name a color.", "completion": " Blue"}

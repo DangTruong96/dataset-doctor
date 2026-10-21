@@ -1,0 +1,6 @@
+{"messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "Paris."}]}
+{"messages": [{"role": "user", "content": "Name a primary color."}, {"role": "assistant", "content": "Blue."}]}
+{"messages": [{"role": "user", "content": "How many days are in a leap year?"}, {"role": "assistant", "content": "366 days."}]}
+{"messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Translate 'thank you' to German."}, {"role": "assistant", "content": "Danke."}]}
+{"messages": [{"role": "user", "content": "What is 2 + 2?"}, {"role": "assistant", "content": "4."}]}
+{"messages": [{"role": "user", "content": "Which planet is known as the Red Planet?"}, {"role": "assistant", "content": "Mars."}]}
