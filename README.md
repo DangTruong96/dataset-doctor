@@ -31,9 +31,12 @@ into a browser tab.
 DatasetDoctor is the missing pre-flight check: run it in seconds, fix the
 named lines, upload once.
 
-## Install
+## Requirements
 
-Requires Python 3.9+. There is nothing else to install.
+- Python 3.9+
+- No third-party dependencies — standard library only, nothing else to install.
+
+## Install
 
 ```bash
 # from a clone
