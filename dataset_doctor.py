@@ -4,8 +4,10 @@
 Validates chat-format ({"messages": [...]}) and prompt/completion JSONL
 files the way training APIs wish you had *before* upload: every problem is
 reported with its line number. Also detects exact and normalized
-duplicate examples, conflicting answers to the same prompt, train/val
-leakage between two files, and provides deterministic dedupe and split
+duplicate examples, conflicting answers to the same prompt, near-duplicate
+examples that differ in wording (character-shingle text similarity,
+opt-in via --similarity), train/val leakage between two files (exact,
+normalized, or paraphrased), and provides deterministic dedupe and split
 commands.
 
 Born from a recurring public failure: fine-tuning jobs rejected for
@@ -119,6 +121,128 @@ def message_text(message):
 
 
 # ---------------------------------------------------------------------------
+# Text similarity — near-duplicates that normalization cannot see
+#
+# Two examples can say almost the same thing in different words (a
+# paraphrase, a lightly edited copy, the same template answer pasted under
+# reworded questions). Exact and normalized hashes miss those completely,
+# yet they still bias training and — worse — leak across a train/val
+# split, inflating eval scores.
+#
+# Similarity is the Jaccard index of the texts' character 5-gram
+# ("shingle") sets, computed on whitespace-collapsed, case-folded text.
+# Character shingles are used instead of word shingles because they work
+# the same for unspaced scripts (Japanese, Chinese) as for spaced ones —
+# this tool's token estimator is already CJK-aware, and duplicate
+# detection should be too.
+# ---------------------------------------------------------------------------
+
+SHINGLE_SIZE = 5
+DEFAULT_SIMILARITY = 0.8
+
+
+def text_shingles(text):
+    """Set of character 5-grams of the normalized text. Texts shorter
+    than one shingle contribute their whole normalized form, so very
+    short examples are still comparable (and identical short texts score
+    1.0). Empty text yields an empty set."""
+    normalized = " ".join(text.split()).casefold()
+    if not normalized:
+        return set()
+    if len(normalized) <= SHINGLE_SIZE:
+        return {normalized}
+    return {normalized[i:i + SHINGLE_SIZE]
+            for i in range(len(normalized) - SHINGLE_SIZE + 1)}
+
+
+def jaccard_similarity(set_a, set_b):
+    """|A ∩ B| / |A ∪ B|; 0.0 when either set is empty."""
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    if not intersection:
+        return 0.0
+    return intersection / len(set_a | set_b)
+
+
+def similar_pairs(texts, threshold, skip_pairs=frozenset(),
+                  skip_groups=None, reportable=None):
+    """Find pairs of texts whose shingle Jaccard similarity is at least
+    `threshold` (0 < threshold <= 1).
+
+    `texts` is a list of (key, text) with unique keys; the result is a
+    list of (key_a, key_b, similarity) in input order, each unordered
+    pair reported once. Pairs in `skip_pairs` (as (earlier_key,
+    later_key)) are not reported, and neither are pairs whose keys map
+    to the same label in `skip_groups` — callers use these to avoid
+    repeating pairs already flagged as exact/normalized duplicates
+    (a duplicate cluster shares one label, so no pair inside a cluster
+    is ever re-reported as merely "similar").
+
+    Each later key is reported at most once, against the *earliest*
+    earlier key it resembles — the same convention as the exact-
+    duplicate warnings ("duplicate of line N" names the first
+    occurrence). Besides keeping reports readable, this bounds the
+    work: inside a large cluster of mutually similar texts the number
+    of reported pairs is linear in the input size, not quadratic.
+    `reportable`, when given, is a callable (earlier_key, later_key)
+    -> bool: pairs it rejects are skipped *without* using up the
+    later key's one report (leakage uses it to consider only
+    cross-file pairs).
+
+    Candidate pairs come from a prefix index: for Jaccard threshold t,
+    two sets can only reach t if the rarest-first prefixes of their
+    shingle sets (length |A| - ceil(t*|A|) + 1) overlap, so only prefix
+    sharers are ever compared in full. The filter is exact — it prunes
+    comparisons, never results.
+    """
+    docs = []
+    doc_freq = Counter()
+    for key, text in texts:
+        shingles = text_shingles(text)
+        if not shingles:
+            continue
+        docs.append((key, shingles))
+        doc_freq.update(shingles)
+    # Rarest shingles first: makes prefixes selective and the ordering
+    # deterministic (frequency, then the shingle itself).
+    rank = {shingle: i for i, shingle in
+            enumerate(sorted(doc_freq, key=lambda s: (doc_freq[s], s)))}
+    index = {}
+    pairs = []
+    for pos, (key, shingles) in enumerate(docs):
+        ordered = sorted(shingles, key=lambda s: rank[s])
+        prefix_len = len(ordered) - math.ceil(threshold * len(ordered)) + 1
+        prefix = ordered[:max(1, prefix_len)]
+        candidates = set()
+        for shingle in prefix:
+            candidates.update(index.get(shingle, ()))
+        for other_pos in sorted(candidates):
+            other_key, other_shingles = docs[other_pos]
+            if (other_key, key) in skip_pairs:
+                continue
+            if reportable is not None \
+                    and not reportable(other_key, key):
+                continue
+            if skip_groups is not None \
+                    and skip_groups.get(other_key) is not None \
+                    and skip_groups.get(other_key) == skip_groups.get(key):
+                continue
+            # Size filter: Jaccard >= t requires the set sizes to be
+            # within a factor of t of each other.
+            if len(other_shingles) < threshold * len(shingles) \
+                    or len(shingles) < threshold * len(other_shingles):
+                continue
+            sim = jaccard_similarity(other_shingles, shingles)
+            if sim >= threshold:
+                pairs.append((other_key, key, sim))
+                break  # one report per later key: the earliest match
+        for shingle in prefix:
+            index.setdefault(shingle, []).append(pos)
+    return pairs
+
+
+# ---------------------------------------------------------------------------
 # File loading — byte level, so BOM and encoding damage get line numbers
 # ---------------------------------------------------------------------------
 
@@ -224,8 +348,11 @@ def _check_prompt_completion(record, line_no, add):
         add("warning", line_no, "completion is empty")
 
 
-def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS):
-    """Validate one JSONL file; return a report dict."""
+def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS, similarity=0.0):
+    """Validate one JSONL file; return a report dict. With
+    `similarity` > 0, also warn about example pairs whose text is at
+    least that similar (character-shingle Jaccard) without being exact
+    or normalized duplicates."""
     report = {
         "file": path,
         "format": None,
@@ -258,6 +385,9 @@ def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS):
     token_counts = []
     role_counter = Counter()
     file_format = None
+    record_texts = []   # (line_no, full text) for the similarity pass
+    dupe_pairs = set()  # (first_line, later_line) already flagged as dupes
+    norm_groups = {}    # line_no -> normalized hash (its duplicate cluster)
 
     for line_no, text, decode_error in lines:
         if decode_error is not None:
@@ -304,7 +434,9 @@ def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS):
                 "unrecognized record shape (no 'messages', no "
                 "prompt/completion pair) — only JSON validity was checked")
 
-        tokens = estimate_tokens(record_text(record))
+        text = record_text(record)
+        record_texts.append((line_no, text))
+        tokens = estimate_tokens(text)
         token_counts.append(tokens)
         if max_tokens and tokens > max_tokens:
             add("warning", line_no,
@@ -313,14 +445,17 @@ def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS):
                 "training APIs" % (tokens, max_tokens))
 
         chash = canonical_hash(record)
+        nhash = normalized_hash(record)
+        norm_groups[line_no] = nhash
         if chash in exact_seen:
+            dupe_pairs.add((exact_seen[chash], line_no))
             add("warning", line_no,
                 "exact duplicate of line %d — duplicates waste training "
                 "budget and bias the model" % exact_seen[chash])
         else:
             exact_seen[chash] = line_no
-            nhash = normalized_hash(record)
             if nhash in norm_seen:
+                dupe_pairs.add((norm_seen[nhash], line_no))
                 add("warning", line_no,
                     "near-duplicate of line %d (identical after "
                     "whitespace/case normalization)" % norm_seen[nhash])
@@ -349,6 +484,22 @@ def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS):
 
         if len(report["errors"]) == before:
             report["valid"] += 1
+
+    if similarity and similarity > 0:
+        for first_line, later_line, sim in similar_pairs(
+                record_texts, similarity, skip_pairs=dupe_pairs,
+                skip_groups=norm_groups):
+            add("warning", later_line,
+                "text is %.0f%% similar to line %d — possible "
+                "near-duplicate with different wording, which exact and "
+                "normalized duplicate checks cannot see; paraphrased "
+                "duplicates still bias training and inflate eval scores "
+                "when they cross a split"
+                % (sim * 100, first_line))
+        # The similarity pass runs after the per-line pass; restore
+        # line order so the report reads top to bottom.
+        report["warnings"].sort(
+            key=lambda w: (w["line"] is None, w["line"] or 0))
 
     if report["examples"] == 0 and not report["errors"]:
         add("error", None, "file contains no examples")
@@ -434,7 +585,13 @@ def split_lines(raw_lines, val_ratio, seed):
     return train, val
 
 
-def leakage_report(path_a, path_b):
+def leakage_report(path_a, path_b, similarity=0.0):
+    """Compare two files for shared examples. Returns exact and
+    normalized-hash overlaps as (line_in_b, line_in_a) pairs; with
+    `similarity` > 0, also cross-file pairs whose text is at least that
+    similar (paraphrase leakage), as (line_in_b, line_in_a, similarity)
+    triples — pairs already reported as exact/normalized are not
+    repeated in the similar list."""
     def hashes(path):
         exact, norm = {}, {}
         for line_no, _raw, record in iter_records(path):
@@ -450,7 +607,24 @@ def leakage_report(path_a, path_b):
     norm_overlap = [(norm_b[h], norm_a[h]) for h in norm_b
                     if h in norm_a
                     and (norm_b[h], norm_a[h]) not in exact_pairs]
-    return {"exact": exact_overlap, "normalized_only": norm_overlap}
+    result = {"exact": exact_overlap, "normalized_only": norm_overlap,
+              "similar": []}
+    if similarity and similarity > 0:
+        known = {(("a", a_line), ("b", b_line))
+                 for b_line, a_line in exact_overlap + norm_overlap}
+        texts = [(("a", line_no), record_text(record))
+                 for line_no, _raw, record in iter_records(path_a)]
+        texts += [(("b", line_no), record_text(record))
+                  for line_no, _raw, record in iter_records(path_b)]
+        cross_file = lambda key_a, key_b: key_a[0] != key_b[0]  # noqa: E731
+        for key_a, key_b, sim in similar_pairs(
+                texts, similarity, skip_pairs=known,
+                reportable=cross_file):
+            # a-records precede b-records in `texts`, so a cross pair
+            # always arrives as (a_key, b_key)
+            result["similar"].append((key_b[1], key_a[1], sim))
+        result["similar"].sort()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -465,11 +639,25 @@ def _print_issue_list(issues, label, cap=20):
         print("  … and %d more %s" % (len(issues) - cap, label))
 
 
+def _check_similarity_arg(args):
+    """Return an error string if --similarity is out of range."""
+    if args.similarity is not None \
+            and not 0.0 < args.similarity <= 1.0:
+        return ("--similarity must be in the range (0, 1], got %s"
+                % args.similarity)
+    return None
+
+
 def cmd_check(args):
+    bad = _check_similarity_arg(args)
+    if bad:
+        print("dataset-doctor: %s" % bad, file=sys.stderr)
+        return 2
     reports = []
     any_errors = False
     for path in args.files:
-        report = validate_file(path, max_tokens=args.max_tokens)
+        report = validate_file(path, max_tokens=args.max_tokens,
+                               similarity=args.similarity or 0.0)
         reports.append(report)
         if report["errors"]:
             any_errors = True
@@ -553,19 +741,29 @@ def cmd_split(args):
 
 
 def cmd_leakage(args):
+    bad = _check_similarity_arg(args)
+    if bad:
+        print("dataset-doctor: %s" % bad, file=sys.stderr)
+        return 2
     try:
-        result = leakage_report(args.file_a, args.file_b)
+        result = leakage_report(args.file_a, args.file_b,
+                                similarity=args.similarity or 0.0)
     except OSError as exc:
         print("dataset-doctor: %s" % exc, file=sys.stderr)
         return 2
-    total = len(result["exact"]) + len(result["normalized_only"])
+    total = len(result["exact"]) + len(result["normalized_only"]) \
+        + len(result["similar"])
     if args.json:
         print(json.dumps({"leaked_examples": total,
                           "exact": [{"in_b_line": b, "in_a_line": a}
                                     for b, a in result["exact"]],
                           "normalized_only": [
                               {"in_b_line": b, "in_a_line": a}
-                              for b, a in result["normalized_only"]]},
+                              for b, a in result["normalized_only"]],
+                          "similar": [
+                              {"in_b_line": b, "in_a_line": a,
+                               "similarity": round(sim, 3)}
+                              for b, a, sim in result["similar"]]},
                          indent=2))
     else:
         for b_line, a_line in result["exact"][:20]:
@@ -575,6 +773,11 @@ def cmd_leakage(args):
             print("LEAK: %s line %d matches %s line %d after "
                   "whitespace/case normalization"
                   % (args.file_b, b_line, args.file_a, a_line))
+        for b_line, a_line, sim in result["similar"][:20]:
+            print("LEAK: %s line %d is %.0f%% similar to %s line %d — "
+                  "possible paraphrase leakage"
+                  % (args.file_b, b_line, sim * 100,
+                     args.file_a, a_line))
         if total:
             print("leakage FAILED — %d example(s) appear in both files"
                   % total)
@@ -603,6 +806,13 @@ def main(argv=None):
                               "exceed this (0 = off, default: %(default)s)")
     p_check.add_argument("--json", action="store_true",
                          help="print the full report as JSON")
+    p_check.add_argument("--similarity", type=float, default=None,
+                         metavar="T",
+                         help="also warn about examples whose text is at "
+                              "least T similar (0 < T <= 1, character-"
+                              "shingle Jaccard) without being exact or "
+                              "normalized duplicates — catches paraphrased "
+                              "near-duplicates (suggested: 0.8)")
     p_check.set_defaults(func=cmd_check)
 
     p_dedupe = sub.add_parser(
@@ -633,6 +843,12 @@ def main(argv=None):
     p_leak.add_argument("file_a")
     p_leak.add_argument("file_b")
     p_leak.add_argument("--json", action="store_true")
+    p_leak.add_argument("--similarity", type=float, default=None,
+                        metavar="T",
+                        help="also fail on cross-file example pairs whose "
+                             "text is at least T similar (0 < T <= 1, "
+                             "character-shingle Jaccard) — catches "
+                             "paraphrase leakage (suggested: 0.8)")
     p_leak.set_defaults(func=cmd_leakage)
 
     args = parser.parse_args(argv)
