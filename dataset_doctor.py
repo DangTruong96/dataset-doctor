@@ -30,7 +30,7 @@ import statistics
 import sys
 from collections import Counter
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 VALID_ROLES = ("system", "user", "assistant", "tool")
 DEFAULT_MAX_TOKENS = 4096

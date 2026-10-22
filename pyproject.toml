@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dataset-doctor"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pre-flight checks for fine-tuning / eval JSONL datasets: format validation with line numbers, duplicate and leakage detection, dedupe and split."
 readme = "README.md"
 license = { text = "MIT" }
