@@ -13,6 +13,7 @@ ROOT = os.path.join(os.path.dirname(__file__), "..")
 GOOD = os.path.join(ROOT, "examples", "good.jsonl")
 MESSY = os.path.join(ROOT, "examples", "messy.jsonl")
 DUPES = os.path.join(ROOT, "examples", "dupes.jsonl")
+SIMILAR = os.path.join(ROOT, "examples", "similar.jsonl")
 
 CHAT = ('{"messages": [{"role": "user", "content": "Hi"}, '
         '{"role": "assistant", "content": "Hello"}]}')
@@ -208,6 +209,185 @@ class TestDedupeSplitLeakage(unittest.TestCase):
         self.assertEqual(len(result["normalized_only"]), 0)
 
 
+PARA_A = ("To reset your password, open the settings page, choose "
+          "security, and follow the link we email to you to create a new "
+          "password for your account.")
+PARA_B = ("To reset your password, open the settings page, choose "
+          "security, and follow the link we send by email to create a "
+          "new strong password for your account.")
+UNRELATED = ("The mitochondria is the powerhouse of the cell and "
+             "produces most of the chemical energy needed to power the "
+             "cell's biochemical reactions.")
+
+
+class TestTextShingles(unittest.TestCase):
+    def test_shingles_are_character_5grams(self):
+        self.assertEqual(dd.text_shingles("abcdefgh"),
+                         {"abcde", "bcdef", "cdefg", "defgh"})
+
+    def test_shingles_normalize_case_and_whitespace(self):
+        self.assertEqual(dd.text_shingles("Hello   World"),
+                         dd.text_shingles("hello world"))
+
+    def test_shingles_short_text_is_a_single_shingle(self):
+        self.assertEqual(dd.text_shingles("abc"), {"abc"})
+        self.assertEqual(dd.text_shingles("abcde"), {"abcde"})
+
+    def test_shingles_empty_text(self):
+        self.assertEqual(dd.text_shingles(""), set())
+        self.assertEqual(dd.text_shingles("   "), set())
+
+    def test_shingles_cjk_text(self):
+        shingles = dd.text_shingles("こんにちは世界")
+        self.assertEqual(len(shingles), 3)  # 7 chars -> three 5-grams
+        self.assertIn("こんにちは", shingles)
+
+
+class TestJaccardSimilarity(unittest.TestCase):
+    def test_identical_sets(self):
+        self.assertEqual(dd.jaccard_similarity({"a", "b"}, {"a", "b"}),
+                         1.0)
+
+    def test_disjoint_sets(self):
+        self.assertEqual(dd.jaccard_similarity({"a"}, {"b"}), 0.0)
+
+    def test_partial_overlap(self):
+        self.assertEqual(
+            dd.jaccard_similarity({"a", "b", "c"}, {"b", "c", "d"}), 0.5)
+
+    def test_empty_sets(self):
+        self.assertEqual(dd.jaccard_similarity(set(), {"a"}), 0.0)
+        self.assertEqual(dd.jaccard_similarity(set(), set()), 0.0)
+
+
+class TestSimilarPairs(unittest.TestCase):
+    TEXTS = [(1, PARA_A), (2, PARA_B), (3, UNRELATED)]
+
+    def test_paraphrase_detected_unrelated_ignored(self):
+        pairs = dd.similar_pairs(self.TEXTS, 0.5)
+        self.assertEqual([(a, b) for a, b, _s in pairs], [(1, 2)])
+        self.assertGreaterEqual(pairs[0][2], 0.5)
+        self.assertLess(pairs[0][2], 1.0)  # similar, not identical
+
+    def test_threshold_is_respected(self):
+        # the paraphrase pair scores ~0.78: found at 0.5, not at 0.95
+        self.assertEqual(len(dd.similar_pairs(self.TEXTS, 0.5)), 1)
+        self.assertEqual(dd.similar_pairs(self.TEXTS, 0.95), [])
+
+    def test_identical_texts_score_one(self):
+        pairs = dd.similar_pairs([(1, PARA_A), (2, PARA_A)], 0.99)
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0][2], 1.0)
+
+    def test_skip_pairs_are_not_reported(self):
+        pairs = dd.similar_pairs(self.TEXTS, 0.5,
+                                 skip_pairs=frozenset({(1, 2)}))
+        self.assertEqual(pairs, [])
+
+    def test_skip_groups_suppress_whole_clusters(self):
+        # keys 1 and 2 are in one duplicate cluster: their pair is
+        # suppressed; key 3 still pairs — once, with the earliest key
+        texts = [(1, PARA_A), (2, PARA_A), (3, PARA_B)]
+        groups = {1: "cluster-x", 2: "cluster-x", 3: "cluster-y"}
+        pairs = dd.similar_pairs(texts, 0.5, skip_groups=groups)
+        self.assertEqual([(a, b) for a, b, _s in pairs], [(1, 3)])
+
+    def test_one_report_per_later_key_against_earliest_match(self):
+        texts = [(1, PARA_A), (2, PARA_A), (3, PARA_A)]
+        pairs = dd.similar_pairs(texts, 0.5)
+        self.assertEqual([(a, b) for a, b, _s in pairs], [(1, 2), (1, 3)])
+
+    def test_reportable_rejection_does_not_use_up_the_report(self):
+        # key 3 resembles both key 1 (rejected by the predicate) and
+        # key 2 (accepted): the accepted pair is still reported
+        texts = [(1, PARA_A), (2, PARA_B), (3, PARA_A)]
+        pairs = dd.similar_pairs(
+            texts, 0.5, reportable=lambda a, b: a != 1)
+        self.assertEqual([(a, b) for a, b, _s in pairs], [(2, 3)])
+
+    def test_empty_texts_never_pair(self):
+        self.assertEqual(dd.similar_pairs([(1, ""), (2, "")], 0.1), [])
+        self.assertEqual(dd.similar_pairs([(1, "  "), (2, PARA_A)], 0.1),
+                         [])
+
+    def test_pairs_follow_input_order(self):
+        texts = [(10, PARA_A), (20, UNRELATED), (30, PARA_B)]
+        pairs = dd.similar_pairs(texts, 0.5)
+        self.assertEqual([(a, b) for a, b, _s in pairs], [(10, 30)])
+
+
+class TestCheckSimilarity(unittest.TestCase):
+    def test_similarity_off_by_default(self):
+        report = dd.validate_file(SIMILAR)
+        msgs = [w["message"] for w in report["warnings"]]
+        self.assertFalse(any("similar to line" in m for m in msgs))
+        self.assertEqual(report["errors"], [])
+
+    def test_paraphrase_flagged_with_both_line_numbers(self):
+        report = dd.validate_file(SIMILAR, similarity=0.8)
+        hits = [w for w in report["warnings"]
+                if "similar to line 1" in w["message"]]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["line"], 2)
+        self.assertEqual(report["errors"], [])
+
+    def test_duplicates_not_double_reported_as_similar(self):
+        # dupes.jsonl's pairs are exact/normalized duplicates; even at a
+        # low similarity threshold they must not reappear as "similar"
+        report = dd.validate_file(DUPES, similarity=0.5)
+        msgs = [w["message"] for w in report["warnings"]]
+        self.assertTrue(any("exact duplicate" in m for m in msgs))
+        self.assertFalse(any("% similar" in m for m in msgs))
+
+    def test_similarity_warnings_keep_line_order(self):
+        with open(SIMILAR, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        other = ('{"messages": [{"role": "user", "content": "Which '
+                 'organelle makes energy?"}, {"role": "assistant", '
+                 '"content": "The mitochondria."}]}\n')
+        other_shouted = other.replace("Which", "WHICH").replace(
+            "mitochondria", "MITOCHONDRIA")
+        path = write_tmp(self, lines[0] + "\n" + lines[1] + "\n"
+                         + other + other_shouted)
+        report = dd.validate_file(path, similarity=0.8)
+        warn_lines = [w["line"] for w in report["warnings"]]
+        self.assertIn(2, warn_lines)   # paraphrase of line 1
+        self.assertIn(4, warn_lines)   # normalized duplicate of line 3
+        self.assertEqual(warn_lines, sorted(warn_lines))
+
+
+class TestLeakageSimilarity(unittest.TestCase):
+    def _split_similar_example(self):
+        with open(SIMILAR, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        a = write_tmp(self, lines[0] + "\n")
+        b = write_tmp(self, lines[1] + "\n")
+        return a, b
+
+    def test_paraphrase_leakage_detected(self):
+        a, b = self._split_similar_example()
+        result = dd.leakage_report(a, b, similarity=0.8)
+        self.assertEqual(result["exact"], [])
+        self.assertEqual(result["normalized_only"], [])
+        self.assertEqual(len(result["similar"]), 1)
+        in_b, in_a, sim = result["similar"][0]
+        self.assertEqual((in_b, in_a), (1, 1))
+        self.assertGreaterEqual(sim, 0.8)
+
+    def test_paraphrase_invisible_without_similarity(self):
+        a, b = self._split_similar_example()
+        result = dd.leakage_report(a, b)
+        self.assertEqual(result["similar"], [])
+        self.assertEqual(result["exact"], [])
+        self.assertEqual(result["normalized_only"], [])
+
+    def test_exact_match_not_repeated_as_similar(self):
+        a, _b = self._split_similar_example()
+        result = dd.leakage_report(a, a, similarity=0.8)
+        self.assertEqual(len(result["exact"]), 1)
+        self.assertEqual(result["similar"], [])
+
+
 class TestCliEndToEnd(unittest.TestCase):
     def run_cli(self, *argv):
         return subprocess.run(
@@ -269,6 +449,60 @@ class TestCliEndToEnd(unittest.TestCase):
         proc = self.run_cli("--help")
         self.assertEqual(proc.returncode, 0)
         self.assertIn("dedupe", proc.stdout)
+
+
+class TestCliSimilarity(unittest.TestCase):
+    def run_cli(self, *argv):
+        return subprocess.run(
+            [sys.executable, os.path.join(ROOT, "dataset_doctor.py"),
+             *argv],
+            capture_output=True, text=True)
+
+    def _split_similar_example(self, testcase):
+        with open(SIMILAR, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        a = write_tmp(testcase, lines[0] + "\n")
+        b = write_tmp(testcase, lines[1] + "\n")
+        return a, b
+
+    def test_check_similarity_flag(self):
+        proc = self.run_cli("check", SIMILAR, "--similarity", "0.8")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("similar to line 1", proc.stdout)
+        proc = self.run_cli("check", SIMILAR)
+        self.assertEqual(proc.returncode, 0)
+        self.assertNotIn("similar to line", proc.stdout)
+
+    def test_check_similarity_json_contains_warning(self):
+        proc = self.run_cli("check", SIMILAR, "--similarity", "0.8",
+                            "--json")
+        self.assertEqual(proc.returncode, 0)
+        warnings = json.loads(proc.stdout)["files"][0]["warnings"]
+        self.assertTrue(any("similar to line 1" in w["message"]
+                            for w in warnings))
+
+    def test_check_similarity_out_of_range_exit_2(self):
+        for value in ("0", "1.5", "-0.2"):
+            proc = self.run_cli("check", SIMILAR, "--similarity", value)
+            self.assertEqual(proc.returncode, 2, value)
+
+    def test_leakage_similarity_flag(self):
+        a, b = self._split_similar_example(self)
+        proc = self.run_cli("leakage", a, b)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        proc = self.run_cli("leakage", a, b, "--similarity", "0.8")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("paraphrase leakage", proc.stdout)
+
+    def test_leakage_similarity_json(self):
+        a, b = self._split_similar_example(self)
+        proc = self.run_cli("leakage", a, b, "--similarity", "0.8",
+                            "--json")
+        self.assertEqual(proc.returncode, 1)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["leaked_examples"], 1)
+        self.assertEqual(len(payload["similar"]), 1)
+        self.assertGreaterEqual(payload["similar"][0]["similarity"], 0.8)
 
 
 if __name__ == "__main__":
