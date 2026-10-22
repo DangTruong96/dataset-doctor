@@ -1,6 +1,6 @@
 # Examples
 
-Three small datasets that show what DatasetDoctor does. All outputs
+Four small datasets that show what DatasetDoctor does. All outputs
 below are real, captured from the commands shown.
 
 ## `good.jsonl` — a clean chat dataset
@@ -38,3 +38,19 @@ differs only in spacing/case.
 python dataset_doctor.py dedupe examples/dupes.jsonl              # removes 1
 python dataset_doctor.py dedupe examples/dupes.jsonl --normalized # removes 2
 ```
+
+## `similar.jsonl` — paraphrased near-duplicates
+
+Four chat examples: a password-reset Q&A; the same Q&A with the
+question reworded and one verb changed in the answer (91% similar by
+character-shingle Jaccard — invisible to exact and normalized hashes);
+an unrelated science example; and a same-domain but genuinely distinct
+account question that stays below threshold.
+
+```bash
+python dataset_doctor.py check examples/similar.jsonl                    # no warnings
+python dataset_doctor.py check examples/similar.jsonl --similarity 0.8   # flags line 2
+```
+
+Split lines 1 and 2+ across two files to see paraphrase leakage:
+`leakage` passes without the flag and fails with `--similarity 0.8`.

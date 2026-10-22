@@ -5,9 +5,10 @@
 `dataset-doctor` validates chat-format (`{"messages": [...]}`) and
 prompt/completion JSONL files *before* you upload them — and, unlike the
 training APIs, it tells you **which line** is broken. It also finds exact
-and near-duplicate examples, conflicting answers to the same prompt, and
-train/validation leakage, and it can dedupe and split a dataset
-deterministically.
+and near-duplicate examples — including paraphrased copies that differ in
+wording, via opt-in text-similarity detection — conflicting answers to
+the same prompt, and train/validation leakage, and it can dedupe and
+split a dataset deterministically.
 
 Pure Python standard library. No dependencies, no network, no API keys —
 your training data never leaves your machine.
@@ -93,6 +94,38 @@ dataset-doctor check data/train.jsonl || echo "dataset not ready"
 dataset-doctor check data/train.jsonl --json   # machine-readable report
 ```
 
+With `--similarity T` (0 < T ≤ 1), `check` adds a third duplicate
+pass: examples whose **text** is at least T similar to an earlier line —
+even with completely different wording — are flagged with both line
+numbers and the similarity score. The bundled `examples/similar.jsonl`
+holds two password-reset examples that share no exact or normalized
+hash (one question is reworded, one verb in the answer changed). Real
+output:
+
+```bash
+dataset-doctor check examples/similar.jsonl --similarity 0.8
+```
+
+```text
+examples/similar.jsonl — format: chat, 4 example(s), 4 valid, 0 error(s), 1 warning(s)
+  estimated tokens: total 252, min 52, median 63.5, mean 63, max 73
+  warnings:
+  line 2: text is 91% similar to line 1 — possible near-duplicate with different wording, which exact and normalized duplicate checks cannot see; paraphrased duplicates still bias training and inflate eval scores when they cross a split
+check passed
+```
+
+Similarity is the Jaccard index of the texts' character 5-gram
+("shingle") sets over whitespace-collapsed, case-folded text. Character
+shingles — rather than word shingles — keep the measure identical for
+unspaced scripts (Japanese, Chinese) and spaced ones. Each example is
+reported once, against the earliest line it resembles, and pairs already
+flagged as exact/normalized duplicates are never re-reported. Candidate
+pairs come from a prefix index, so the pass stays fast on real files
+(a synthetic 5,000-example file of heavily templated records checks in
+~6 s). Start at `--similarity 0.8` and lower it toward 0.7 if you want
+looser paraphrases too. It is off by default because it is a judgement
+call, not an error.
+
 What `check` catches:
 
 | Class | Examples |
@@ -101,7 +134,7 @@ What `check` catches:
 | Line level | invalid JSON (with column), line is not a JSON object, mixed formats in one file |
 | Chat structure | missing/invalid role, system message not first, empty content, no user or no assistant message, conversation not ending with an assistant reply |
 | Prompt/completion | missing keys, non-string or empty prompt |
-| Dataset hygiene (warnings) | exact duplicates, near-duplicates (whitespace/case), same prompt with conflicting answers, consecutive user turns, over-length examples (estimated tokens over `--max-tokens`, default 4096) |
+| Dataset hygiene (warnings) | exact duplicates, near-duplicates (whitespace/case), near-duplicates by text similarity (opt-in, `--similarity`), same prompt with conflicting answers, consecutive user turns, over-length examples (estimated tokens over `--max-tokens`, default 4096) |
 
 Token counts are a **heuristic estimate** (~1 token per CJK character,
 ~4 characters per token otherwise) meant for spotting outliers — not a
@@ -146,6 +179,24 @@ Leakage is checked by exact hash and by normalized hash (whitespace/case
 insensitive), so a validation example that was lightly edited still
 counts as leaked.
 
+Add `--similarity T` and the check also fails on **paraphrase
+leakage**: a validation example that is a reworded copy of a training
+example — the case exact and normalized hashes structurally cannot
+see. Splitting the first two lines of `examples/similar.jsonl` across
+two files passes the plain check and fails with the flag:
+
+```bash
+dataset-doctor leakage /tmp/train.jsonl /tmp/val.jsonl
+# no leakage — the two files share no examples
+
+dataset-doctor leakage /tmp/train.jsonl /tmp/val.jsonl --similarity 0.8
+# LEAK: /tmp/val.jsonl line 1 is 91% similar to /tmp/train.jsonl line 1 — possible paraphrase leakage
+# leakage FAILED — 1 example(s) appear in both files   (exit code 1)
+```
+
+The similar pairs also appear in the `--json` report (with their
+similarity scores), so CI can archive them.
+
 ## Formats
 
 - **Chat**: `{"messages": [{"role": "system"|"user"|"assistant"|"tool", "content": "..."}]}` —
@@ -157,10 +208,12 @@ counts as leaked.
 
 ## Roadmap
 
-- v0.2: preference/DPO format checks (`chosen`/`rejected`), per-role
+- v0.3: preference/DPO format checks (`chosen`/`rejected`), per-role
   token breakdown, `--fix` mode for BOM and trailing-whitespace repair.
-- v0.3: near-duplicate detection by text similarity (not just
-  normalization), CSV/JSON-array import, HTML report.
+- v0.4: CSV/JSON-array import, HTML report.
+
+(Shipped in v0.2: near-duplicate detection by text similarity for
+`check` and `leakage` — see `--similarity` above.)
 
 ## Maintainer & governance
 
