@@ -4,6 +4,61 @@ All notable changes to DatasetDoctor are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [semantic versioning](https://semver.org/).
 
+## [0.2.2] - 2026-10-23
+
+### Fixed
+
+A second, adversarial QA round (mutation fuzzing, property tests
+against a brute-force oracle, and pathological hand-crafted inputs)
+found six defects — all of them crashes or silent mis-validations on
+inputs the first pass did not try. All are fixed; none of the fixes
+changes behavior on well-formed datasets.
+
+- **Deeply nested records crashed `check` with a RecursionError
+  traceback** (the token walker and the value normalizer recurse per
+  nesting level; a record nested ~1,000+ levels deep overflowed the
+  interpreter stack, and `dedupe`/`split`/`leakage` had the same
+  exposure through the parser). Line parsing is now total: values
+  nested deeper than 100 levels are reported as a per-line error
+  ("value is nested too deeply"), and parser-level recursion
+  failures become the same error instead of a traceback.
+- **Integer literals beyond Python's 4,300-digit limit crashed every
+  command** with a raw `ValueError` traceback — the parse sites only
+  caught `JSONDecodeError`. Such lines are now ordinary
+  "invalid JSON" errors.
+- **`NaN`, `Infinity` and `-Infinity` were accepted as valid JSON**
+  (Python's parser allows them by default) and a record containing
+  one validated cleanly. They are not valid JSON — strict parsers,
+  including training APIs, reject them — and are now reported as
+  invalid-JSON errors.
+- **Strings containing lone surrogates** (e.g. from a `"\ud800"`
+  escape) **crashed duplicate/leakage hashing** with a
+  `UnicodeEncodeError`. Hashing now encodes with `surrogatepass`:
+  deterministic, and distinct strings still hash distinctly.
+- **A chat message whose `role` was an array or object crashed
+  `check`** with `TypeError: unhashable type` in the role
+  statistics counter. The invalid role is reported as before; the
+  counter now files non-string roles under "?".
+- **A content part with a non-string `text` value crashed `check`**
+  with a `TypeError` in text extraction. It is now an explicit
+  error ("content part N has non-string 'text'"), mirroring the
+  v0.2.1 fix for non-string scalar content, and text extraction
+  ignores non-string parts instead of crashing.
+
+### Tests
+
+- 11 new regression tests (88 total) covering every fix above,
+  including a CLI sweep asserting no traceback and a documented
+  exit code on a file combining all the pathological lines. All 11
+  fail on the v0.2.1 code and pass on this release.
+- Verified without code changes: a 600-trial property test of the
+  similarity pass against brute-force Jaccard (exact agreement);
+  a 300-file mutation fuzz over all commands (accounting and
+  partition invariants hold); byte-for-byte dedupe/split output
+  integrity on crafted cases; 100,000-line files check in ~31 s;
+  2,000 all-near-duplicate records produce exactly 1,999 similarity
+  warnings in ~4 s.
+
 ## [0.2.1] - 2026-10-23
 
 ### Fixed
