@@ -4,6 +4,51 @@ All notable changes to DatasetDoctor are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [semantic versioning](https://semver.org/).
 
+## [0.2.1] - 2026-10-23
+
+### Fixed
+
+- `check` on an unreadable file (missing path, directory, permission
+  error) now exits with code 2, the documented I/O-error code, instead
+  of 1 — CI can again distinguish "file could not be read" from
+  "dataset has errors", in both text and `--json` modes.
+- Records containing only one of `prompt` / `completion` are now
+  treated as broken prompt/completion records and fail with the
+  missing-key error, instead of being classified as "generic" and
+  passing with only a warning.
+- The `valid` count in `check` summaries no longer counts a record
+  whose only error is the mixed-format error (`examples/messy.jsonl`
+  now correctly reports 3 valid of 7; the README quoted the old,
+  wrong count and has been corrected).
+- Chat messages whose `content` is not a string or a list of content
+  parts (e.g. a number, boolean, or object) are now errors instead of
+  passing silently. `content: null` remains tolerated, as tool-call
+  messages use it legitimately.
+- `dedupe` and `split` summaries now report how many input lines were
+  skipped as unparseable (invalid JSON, JSON arrays/scalars, invalid
+  UTF-8) instead of dropping them silently.
+- `dedupe`/`split` output now preserves each line's original text
+  (only a CRLF carriage return is removed), as the README promises;
+  previously surrounding whitespace was stripped.
+- `split` rejects `--val-ratio` outside [0, 1] and identical
+  `--train-out` / `--val-out` paths with a usage error (exit 2)
+  instead of silently producing a nonsense split or overwriting the
+  train output with the validation output. An empty split side is
+  now written as a truly empty file instead of a single newline.
+- `check` rejects a negative `--max-tokens` with a usage error
+  (exit 2) instead of warning that every example exceeds a negative
+  limit.
+- "Line is not an object" errors now name JSON types (null, string,
+  number, boolean, array) instead of Python type names (NoneType,
+  str, bool, ...).
+
+### Tests
+
+- 17 new regression tests (77 total), one per fix above, including
+  CLI end-to-end coverage of the exit codes. The pre-existing
+  `test_check_missing_file_exit_2` now asserts the exit code its name
+  always promised.
+
 ## [0.2.0] - 2026-10-23
 
 ### Added
