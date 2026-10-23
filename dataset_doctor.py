@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import random
 import statistics
 import sys
@@ -273,11 +274,33 @@ def load_lines(path):
 # Validation
 # ---------------------------------------------------------------------------
 
+def _json_type_name(value):
+    """JSON's name for a parsed value's type (object, array, string,
+    number, boolean, null) — error messages speak JSON, not Python."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
 def detect_format(record):
     if isinstance(record, dict):
         if "messages" in record:
             return "chat"
-        if "prompt" in record and "completion" in record:
+        if "prompt" in record or "completion" in record:
+            # Either key alone means a *broken* prompt/completion
+            # record, so the missing-key error in
+            # _check_prompt_completion can fire — classifying it as
+            # generic would let it pass with only a warning.
             return "prompt-completion"
     return "generic"
 
@@ -307,10 +330,23 @@ def _check_chat(record, line_no, add):
         text = message_text(message)
         if "content" not in message:
             add("error", line_no, "%s has no 'content'" % where)
-        elif not text.strip() and message.get("content") is not None:
-            # Structured content with no text (e.g. image-only) is legal
-            # for user turns in multimodal sets; an empty *string* is not.
-            if isinstance(message.get("content"), str):
+        else:
+            content = message.get("content")
+            if content is not None \
+                    and not isinstance(content, (str, list)):
+                # Training APIs require a string or a list of content
+                # parts; a number/boolean/object used to slip through
+                # silently because it produced no text. (None stays
+                # tolerated: assistant tool-call messages carry
+                # content: null legitimately.)
+                add("error", line_no,
+                    "%s (%s) has invalid 'content': a JSON %s — content "
+                    "must be a string or a list of content parts"
+                    % (where, role, _json_type_name(content)))
+            elif isinstance(content, str) and not text.strip():
+                # Structured content with no text (e.g. image-only) is
+                # legal for user turns in multimodal sets; an empty
+                # *string* is not.
                 add("error", line_no,
                     "%s (%s) has empty content" % (where, role))
     if roles:
@@ -372,6 +408,7 @@ def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS, similarity=0.0):
     if fatal is not None:
         report["errors"].append({"line": None, "message":
                                  "cannot read file: %s" % fatal})
+        report["fatal"] = True  # an I/O error: `check` exits 2, not 1
         return report
     lines, has_bom = loaded
     if has_bom:
@@ -407,10 +444,14 @@ def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS, similarity=0.0):
         if not isinstance(record, dict):
             add("error", line_no,
                 "line is a JSON %s, not an object — every example must be "
-                "one JSON object on one line" % type(record).__name__)
+                "one JSON object on one line" % _json_type_name(record))
             continue
 
         report["examples"] += 1
+        # Captured before *any* per-record error (including the
+        # mixed-format error below), so "valid" only counts examples
+        # with no error at all.
+        before = len(report["errors"])
         fmt = detect_format(record)
         if file_format is None:
             file_format = fmt
@@ -421,7 +462,6 @@ def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS, similarity=0.0):
                 "mixed-format files are rejected by training APIs"
                 % (fmt, file_format))
 
-        before = len(report["errors"])
         if fmt == "chat":
             _check_chat(record, line_no, add)
             for m in record.get("messages", []):
@@ -541,7 +581,9 @@ def _read_stdin():
 # ---------------------------------------------------------------------------
 
 def iter_records(path):
-    """Yield (line_no, raw_text, record) for every parseable object line."""
+    """Yield (line_no, raw_text, record) for every parseable object
+    line. raw_text is the line as written — only the CR of a CRLF
+    ending is removed — so dedupe/split preserve the original text."""
     loaded, fatal = load_lines(path)
     if fatal is not None:
         raise OSError(fatal)
@@ -554,7 +596,39 @@ def iter_records(path):
         except json.JSONDecodeError:
             continue
         if isinstance(record, dict):
-            yield line_no, text.strip(), record
+            raw = text[:-1] if text.endswith("\r") else text
+            yield line_no, raw, record
+
+
+def skipped_line_count(path):
+    """How many non-blank lines iter_records skips: lines that are not
+    parseable JSON objects (invalid JSON, JSON arrays/scalars, invalid
+    UTF-8). dedupe and split report this so dropped lines are never
+    silent."""
+    loaded, fatal = load_lines(path)
+    if fatal is not None:
+        raise OSError(fatal)
+    lines, _ = loaded
+    skipped = 0
+    for _line_no, text, decode_error in lines:
+        if decode_error is not None:
+            skipped += 1
+            continue
+        if not text.strip():
+            continue
+        try:
+            record = json.loads(text)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if not isinstance(record, dict):
+            skipped += 1
+    return skipped
+
+
+def _skipped_note(skipped):
+    return (", skipped %d unparseable line(s)" % skipped) if skipped \
+        else ""
 
 
 def dedupe_file(in_path, normalized=False):
@@ -653,17 +727,26 @@ def cmd_check(args):
     if bad:
         print("dataset-doctor: %s" % bad, file=sys.stderr)
         return 2
+    if args.max_tokens < 0:
+        print("dataset-doctor: --max-tokens must be 0 or greater, got %s"
+              % args.max_tokens, file=sys.stderr)
+        return 2
     reports = []
     any_errors = False
+    any_fatal = False
     for path in args.files:
         report = validate_file(path, max_tokens=args.max_tokens,
                                similarity=args.similarity or 0.0)
         reports.append(report)
         if report["errors"]:
             any_errors = True
+        if report.get("fatal"):
+            any_fatal = True
     if args.json:
         print(json.dumps({"ok": not any_errors, "files": reports},
                          ensure_ascii=False, indent=2))
+        if any_fatal:
+            return 2  # I/O error, as documented — not a dataset error
         return 1 if any_errors else 0
     for report in reports:
         print("%s — format: %s, %d example(s), %d valid, %d error(s), "
@@ -687,17 +770,21 @@ def cmd_check(args):
             _print_issue_list(report["warnings"], "warnings")
     if any_errors:
         print("check FAILED")
-        return 1
-    print("check passed")
-    return 0
+    else:
+        print("check passed")
+    if any_fatal:
+        return 2
+    return 1 if any_errors else 0
 
 
 def cmd_dedupe(args):
     try:
         kept, removed = dedupe_file(args.input, normalized=args.normalized)
+        skipped = skipped_line_count(args.input)
     except OSError as exc:
         print("dataset-doctor: %s" % exc, file=sys.stderr)
         return 2
+    note = _skipped_note(skipped)
     payload = "\n".join(kept) + ("\n" if kept else "")
     if args.output:
         try:
@@ -706,18 +793,27 @@ def cmd_dedupe(args):
         except OSError as exc:
             print("dataset-doctor: %s" % exc, file=sys.stderr)
             return 2
-        print("kept %d example(s), removed %d duplicate(s) → %s"
-              % (len(kept), removed, args.output))
+        print("kept %d example(s), removed %d duplicate(s)%s → %s"
+              % (len(kept), removed, note, args.output))
     else:
         sys.stdout.write(payload)
-        print("kept %d, removed %d duplicate(s)"
-              % (len(kept), removed), file=sys.stderr)
+        print("kept %d, removed %d duplicate(s)%s"
+              % (len(kept), removed, note), file=sys.stderr)
     return 0
 
 
 def cmd_split(args):
+    if not 0.0 <= args.val_ratio <= 1.0:
+        print("dataset-doctor: --val-ratio must be between 0 and 1, "
+              "got %s" % args.val_ratio, file=sys.stderr)
+        return 2
+    if os.path.abspath(args.train_out) == os.path.abspath(args.val_out):
+        print("dataset-doctor: --train-out and --val-out must be "
+              "different files", file=sys.stderr)
+        return 2
     try:
         raw = [raw for _n, raw, _r in iter_records(args.input)]
+        skipped = skipped_line_count(args.input)
     except OSError as exc:
         print("dataset-doctor: %s" % exc, file=sys.stderr)
         return 2
@@ -728,15 +824,16 @@ def cmd_split(args):
     train, val = split_lines(raw, args.val_ratio, args.seed)
     try:
         with open(args.train_out, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(train) + "\n")
+            fh.write("\n".join(train) + ("\n" if train else ""))
         with open(args.val_out, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(val) + "\n")
+            fh.write("\n".join(val) + ("\n" if val else ""))
     except OSError as exc:
         print("dataset-doctor: %s" % exc, file=sys.stderr)
         return 2
     print("split %d example(s) → %d train (%s), %d validation (%s), "
-          "seed %d" % (len(raw), len(train), args.train_out, len(val),
-                       args.val_out, args.seed))
+          "seed %d%s" % (len(raw), len(train), args.train_out, len(val),
+                         args.val_out, args.seed,
+                         _skipped_note(skipped)))
     return 0
 
 

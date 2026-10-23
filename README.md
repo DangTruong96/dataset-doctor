@@ -69,7 +69,7 @@ dataset-doctor check examples/messy.jsonl
 ```
 
 ```text
-examples/messy.jsonl — format: chat, 7 example(s), 4 valid, 7 error(s), 3 warning(s)
+examples/messy.jsonl — format: chat, 7 example(s), 3 valid, 7 error(s), 3 warning(s)
   estimated tokens: total 57, min 4, median 8, mean 8.1, max 11
   errors:
   line 2: invalid JSON: Unterminated string starting at (column 43)

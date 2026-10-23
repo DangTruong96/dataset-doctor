@@ -409,10 +409,14 @@ class TestCliEndToEnd(unittest.TestCase):
             len(payload["files"][0]["errors"]), 4)
 
     def test_check_missing_file_exit_2(self):
+        # the README and module docstring promise exit 2 for I/O errors
+        # (1 is reserved for "file read fine, dataset has errors")
         proc = self.run_cli("check", "/nonexistent/nope.jsonl")
-        self.assertEqual(proc.returncode, 1)  # unreadable file = errors
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("cannot read file", proc.stdout)
         payload = self.run_cli("check", "/nonexistent/nope.jsonl",
                                "--json")
+        self.assertEqual(payload.returncode, 2)
         self.assertFalse(json.loads(payload.stdout)["ok"])
 
     def test_dedupe_then_check_passes(self):
@@ -503,6 +507,190 @@ class TestCliSimilarity(unittest.TestCase):
         self.assertEqual(payload["leaked_examples"], 1)
         self.assertEqual(len(payload["similar"]), 1)
         self.assertGreaterEqual(payload["similar"][0]["similarity"], 0.8)
+
+
+class TestPromptCompletionMissingKeys(unittest.TestCase):
+    """A record with only one of prompt/completion is a broken
+    prompt/completion record, not a 'generic' record that passes."""
+
+    def test_prompt_without_completion_is_an_error(self):
+        path = write_tmp(self, '{"prompt": "What is 2+2?"}\n')
+        report = dd.validate_file(path)
+        self.assertEqual(report["format"], "prompt-completion")
+        self.assertTrue(any("missing 'completion'" in m
+                            for m in error_messages(report)))
+        self.assertEqual(report["valid"], 0)
+
+    def test_completion_without_prompt_is_an_error(self):
+        path = write_tmp(self, '{"completion": " 4"}\n')
+        report = dd.validate_file(path)
+        self.assertEqual(report["format"], "prompt-completion")
+        self.assertTrue(any("missing 'prompt'" in m
+                            for m in error_messages(report)))
+
+
+class TestContentTypes(unittest.TestCase):
+    """Chat 'content' must be a string or a list of parts; other JSON
+    values are rejected by training APIs and must not pass silently."""
+
+    def test_numeric_content_is_an_error(self):
+        path = write_tmp(
+            self,
+            '{"messages": [{"role": "user", "content": 123}, '
+            '{"role": "assistant", "content": "ok"}]}\n')
+        report = dd.validate_file(path)
+        self.assertTrue(any("invalid 'content'" in m
+                            for m in error_messages(report)))
+        self.assertEqual(report["valid"], 0)
+
+    def test_dict_content_is_an_error(self):
+        path = write_tmp(
+            self,
+            '{"messages": [{"role": "user", "content": {"text": "hi"}}, '
+            '{"role": "assistant", "content": "ok"}]}\n')
+        report = dd.validate_file(path)
+        self.assertTrue(any("invalid 'content'" in m
+                            for m in error_messages(report)))
+
+    def test_null_content_is_tolerated(self):
+        # assistant messages with tool calls legitimately carry
+        # content: null; this must not become an error
+        path = write_tmp(
+            self,
+            '{"messages": [{"role": "user", "content": "Hi"}, '
+            '{"role": "assistant", "content": null}]}\n')
+        report = dd.validate_file(path)
+        self.assertEqual(report["errors"], [])
+
+
+class TestValidCounting(unittest.TestCase):
+    def test_mixed_format_record_is_not_counted_valid(self):
+        path = write_tmp(
+            self, CHAT + '\n{"prompt": "Q?", "completion": " A"}\n')
+        report = dd.validate_file(path)
+        self.assertEqual(report["examples"], 2)
+        self.assertEqual(report["valid"], 1)
+
+    def test_messy_file_valid_count(self):
+        # errors sit on 4 of the 7 examples (lines 4, 5, 6, 8)
+        report = dd.validate_file(MESSY)
+        self.assertEqual(report["examples"], 7)
+        self.assertEqual(report["valid"], 3)
+
+
+class TestNonObjectTypeNames(unittest.TestCase):
+    def test_messages_use_json_type_names_not_python(self):
+        path = write_tmp(self, 'null\n"a string"\n42\ntrue\n[1]\n')
+        msgs = error_messages(dd.validate_file(path))
+        self.assertTrue(any("JSON null" in m for m in msgs))
+        self.assertTrue(any("JSON string" in m for m in msgs))
+        self.assertTrue(any("JSON number" in m for m in msgs))
+        self.assertTrue(any("JSON boolean" in m for m in msgs))
+        self.assertTrue(any("JSON array" in m for m in msgs))
+        self.assertFalse(any("NoneType" in m for m in msgs))
+
+
+class TestSkippedLines(unittest.TestCase):
+    DIRTY = CHAT + "\n{broken line\n[1, 2]\n\n" + CHAT + "\n"
+
+    def test_skipped_line_count(self):
+        path = write_tmp(self, self.DIRTY)
+        # the broken-JSON line and the array line; the blank line and
+        # the two valid records do not count
+        self.assertEqual(dd.skipped_line_count(path), 2)
+
+    def test_dedupe_reports_skipped_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "dirty.jsonl")
+            with open(src, "w", encoding="utf-8") as fh:
+                fh.write(self.DIRTY)
+            out = os.path.join(tmp, "out.jsonl")
+            proc = subprocess.run(
+                [sys.executable,
+                 os.path.join(ROOT, "dataset_doctor.py"),
+                 "dedupe", src, "-o", out],
+                capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("skipped 2 unparseable line(s)", proc.stdout)
+
+    def test_split_reports_skipped_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "dirty.jsonl")
+            with open(src, "w", encoding="utf-8") as fh:
+                fh.write(self.DIRTY)
+            proc = subprocess.run(
+                [sys.executable,
+                 os.path.join(ROOT, "dataset_doctor.py"),
+                 "split", src,
+                 "--train-out", os.path.join(tmp, "train.jsonl"),
+                 "--val-out", os.path.join(tmp, "val.jsonl")],
+                capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("skipped 2 unparseable line(s)", proc.stdout)
+
+
+class TestDedupeLineFidelity(unittest.TestCase):
+    def test_surrounding_whitespace_is_preserved(self):
+        # README promises "original line text is preserved"
+        line = '   {"prompt": "Q?", "completion": " A"}   '
+        path = write_tmp(self, line + "\n")
+        kept, removed = dd.dedupe_file(path)
+        self.assertEqual(kept, [line])
+        self.assertEqual(removed, 0)
+
+    def test_crlf_cr_is_not_carried_into_output(self):
+        path = write_tmp(
+            self, b'{"prompt": "Q?", "completion": " A"}\r\n',
+            binary=True)
+        kept, _removed = dd.dedupe_file(path)
+        self.assertEqual(kept, ['{"prompt": "Q?", "completion": " A"}'])
+
+
+class TestCliFlagValidation(unittest.TestCase):
+    def run_cli(self, *argv):
+        return subprocess.run(
+            [sys.executable, os.path.join(ROOT, "dataset_doctor.py"),
+             *argv],
+            capture_output=True, text=True)
+
+    def test_split_val_ratio_out_of_range_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for value in ("1.5", "-0.5"):
+                proc = self.run_cli(
+                    "split", GOOD,
+                    "--train-out", os.path.join(tmp, "t.jsonl"),
+                    "--val-out", os.path.join(tmp, "v.jsonl"),
+                    "--val-ratio", value)
+                self.assertEqual(proc.returncode, 2, value)
+                self.assertIn("--val-ratio", proc.stderr)
+
+    def test_split_same_output_path_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            same = os.path.join(tmp, "same.jsonl")
+            proc = self.run_cli("split", GOOD, "--train-out", same,
+                                "--val-out", same)
+            self.assertEqual(proc.returncode, 2)
+            self.assertFalse(os.path.exists(same))
+
+    def test_split_empty_side_writes_truly_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            train = os.path.join(tmp, "train.jsonl")
+            val = os.path.join(tmp, "val.jsonl")
+            proc = self.run_cli("split", GOOD, "--train-out", train,
+                                "--val-out", val, "--val-ratio", "0")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(os.path.getsize(val), 0)
+            self.assertGreater(os.path.getsize(train), 0)
+            proc = self.run_cli("split", GOOD, "--train-out", train,
+                                "--val-out", val, "--val-ratio", "1")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(os.path.getsize(train), 0)
+            self.assertGreater(os.path.getsize(val), 0)
+
+    def test_check_negative_max_tokens_exit_2(self):
+        proc = self.run_cli("check", GOOD, "--max-tokens", "-1")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--max-tokens", proc.stderr)
 
 
 if __name__ == "__main__":
