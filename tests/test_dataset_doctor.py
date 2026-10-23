@@ -693,5 +693,113 @@ class TestCliFlagValidation(unittest.TestCase):
         self.assertIn("--max-tokens", proc.stderr)
 
 
+class TestAdversarialRound2(unittest.TestCase):
+    """Regression tests from the round-2 adversarial QA pass (fuzzed
+    and pathological inputs): every bad line must become a per-line
+    error — or a clean pass — never a traceback."""
+
+    def test_deeply_nested_value_is_an_error_not_a_crash(self):
+        line = '{"a": ' * 2000 + '1' + '}' * 2000
+        path = write_tmp(self, line + "\n")
+        report = dd.validate_file(path)
+        self.assertEqual(report["examples"], 0)
+        self.assertTrue(any("nested too deeply" in m
+                            for m in error_messages(report)))
+
+    def test_nesting_at_the_cap_still_validates(self):
+        line = '{"a": ' * dd.MAX_JSON_DEPTH + '1' + '}' * dd.MAX_JSON_DEPTH
+        path = write_tmp(self, line + "\n")
+        report = dd.validate_file(path)
+        self.assertEqual(report["examples"], 1)
+        self.assertEqual(report["errors"], [])
+
+    def test_deep_record_is_skipped_consistently(self):
+        line = '{"a": ' * 2000 + '1' + '}' * 2000
+        path = write_tmp(self, line + "\n" + CHAT + "\n")
+        self.assertEqual(dd.skipped_line_count(path), 1)
+        kept, removed = dd.dedupe_file(path)
+        self.assertEqual((len(kept), removed), (1, 0))
+
+    def test_huge_integer_literal_is_an_error_not_a_crash(self):
+        path = write_tmp(self, '{"prompt": "a", "completion": "b", '
+                               '"n": ' + "9" * 5000 + '}\n')
+        report = dd.validate_file(path)
+        self.assertEqual(report["examples"], 0)
+        self.assertTrue(any("invalid JSON" in m
+                            for m in error_messages(report)))
+
+    def test_nan_and_infinity_are_not_valid_json(self):
+        for literal in ("NaN", "Infinity", "-Infinity"):
+            path = write_tmp(
+                self, '{"prompt": "a", "completion": "b", "s": %s}\n'
+                % literal)
+            report = dd.validate_file(path)
+            self.assertEqual(report["examples"], 0, literal)
+            self.assertTrue(any("invalid constant" in m
+                                for m in error_messages(report)),
+                            literal)
+
+    def test_lone_surrogate_does_not_crash_any_command(self):
+        line = '{"prompt": "a\\ud800b", "completion": "x"}'
+        path = write_tmp(self, line + "\n" + line + "\n")
+        report = dd.validate_file(path)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["examples"], 2)
+        kept, removed = dd.dedupe_file(path)
+        self.assertEqual((len(kept), removed), (1, 1))
+        result = dd.leakage_report(path, path)
+        self.assertEqual(len(result["exact"]), 1)
+
+    def test_lone_surrogate_in_chat_content(self):
+        line = ('{"messages": [{"role": "user", "content": "a\\ud800b"}, '
+                '{"role": "assistant", "content": "y"}]}')
+        path = write_tmp(self, line + "\n")
+        report = dd.validate_file(path)
+        self.assertEqual(report["errors"], [])
+
+    def test_non_string_role_does_not_crash_stats(self):
+        for role in ('["user"]', '{"x": 1}', '123'):
+            line = ('{"messages": [{"role": %s, "content": "hi"}, '
+                    '{"role": "assistant", "content": "yo"}]}' % role)
+            path = write_tmp(self, line + "\n")
+            report = dd.validate_file(path)
+            self.assertTrue(any("missing/invalid role" in m
+                                for m in error_messages(report)), role)
+            self.assertEqual(report["stats"]["roles"].get("?"), 1, role)
+
+    def test_non_string_text_part_is_an_error_not_a_crash(self):
+        for text in ('123', '["x"]', '{"t": 1}', 'true'):
+            line = ('{"messages": [{"role": "user", "content": '
+                    '[{"type": "text", "text": %s}]}, '
+                    '{"role": "assistant", "content": "yo"}]}' % text)
+            path = write_tmp(self, line + "\n")
+            report = dd.validate_file(path)
+            self.assertTrue(any("non-string 'text'" in m
+                                for m in error_messages(report)), text)
+
+    def test_message_text_ignores_non_string_parts(self):
+        message = {"content": [{"type": "text", "text": 123},
+                               {"type": "text", "text": "real"},
+                               {"type": "image"}]}
+        self.assertEqual(dd.message_text(message), "real")
+
+    def test_cli_never_tracebacks_on_pathological_file(self):
+        lines = [
+            '{"a": ' * 2000 + '1' + '}' * 2000,
+            '{"prompt": "a", "completion": "b", "n": ' + "9" * 5000 + '}',
+            '{"prompt": "a\\ud800b", "completion": "x"}',
+            '{"messages": [{"role": ["user"], "content": "hi"}]}',
+            '{"prompt": "a", "completion": "b", "s": NaN}',
+        ]
+        path = write_tmp(self, "\n".join(lines) + "\n")
+        for argv in (["check", path], ["check", "--json", path],
+                     ["dedupe", path], ["leakage", path, path]):
+            proc = subprocess.run(
+                [sys.executable, os.path.join(ROOT, "dataset_doctor.py"),
+                 *argv], capture_output=True, text=True)
+            self.assertNotIn("Traceback", proc.stderr, argv)
+            self.assertIn(proc.returncode, (0, 1, 2), argv)
+
+
 if __name__ == "__main__":
     unittest.main()

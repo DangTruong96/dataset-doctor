@@ -31,7 +31,7 @@ import statistics
 import sys
 from collections import Counter
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 VALID_ROLES = ("system", "user", "assistant", "tool")
 DEFAULT_MAX_TOKENS = 4096
@@ -79,7 +79,10 @@ def canonical_hash(record):
     """Hash of the record with object key order normalized away."""
     blob = json.dumps(record, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    # surrogatepass: a string containing a lone surrogate (from a
+    # "\ud800"-style escape in the source) must not crash hashing —
+    # the hash stays deterministic and distinct per distinct string.
+    return hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def normalized_hash(record):
@@ -87,7 +90,7 @@ def normalized_hash(record):
     catches duplicates that differ only in spacing or capitalization."""
     blob = json.dumps(_normalize_value(record), ensure_ascii=False,
                       sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    return hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def record_text(record):
@@ -115,9 +118,12 @@ def message_text(message):
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        texts = [part.get("text", "") for part in content
+        texts = [part.get("text") for part in content
                  if isinstance(part, dict)]
-        return "\n".join(t for t in texts if t)
+        # Only string parts contribute text; a non-string 'text' value
+        # is reported as an error by _check_chat and must not crash
+        # the join here.
+        return "\n".join(t for t in texts if isinstance(t, str) and t)
     return ""
 
 
@@ -244,6 +250,68 @@ def similar_pairs(texts, threshold, skip_pairs=frozenset(),
 
 
 # ---------------------------------------------------------------------------
+# Line parsing — strict and total: every bad line becomes an error
+# message, never an exception
+# ---------------------------------------------------------------------------
+
+MAX_JSON_DEPTH = 100
+
+
+def _json_depth(value):
+    """Nesting depth of a parsed JSON value (a scalar is 0, a container
+    is 1 + its deepest child), measured iteratively so the measurement
+    itself cannot overflow the stack."""
+    deepest = 0
+    stack = [(value, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, (dict, list)):
+            depth += 1
+            if depth > deepest:
+                deepest = depth
+                if deepest > MAX_JSON_DEPTH:
+                    return deepest  # caller only compares to the cap
+            children = node.values() if isinstance(node, dict) else node
+            stack.extend((child, depth) for child in children)
+    return deepest
+
+
+def _reject_constant(name):
+    raise json.JSONDecodeError(
+        "invalid constant %s — NaN and Infinity are not valid JSON"
+        % name, "", 0)
+
+
+def _parse_line(text):
+    """Parse one JSONL line; return (value, None) or (None, message).
+
+    Strict where Python's json module is lenient by default: the
+    constants NaN / Infinity / -Infinity are rejected (they are not
+    valid JSON and strict parsers — including training APIs — refuse
+    them). Total where the parser raises non-JSONDecodeError failures:
+    integers beyond Python's digit limit (a ValueError) and nesting so
+    deep the parser itself recurses out both become ordinary per-line
+    errors. Values nested deeper than MAX_JSON_DEPTH are rejected as
+    well: the token walker and the value normalizer recurse per
+    nesting level, so depth is capped far below the interpreter's
+    recursion limit (real training records nest a handful of levels).
+    """
+    try:
+        value = json.loads(text, parse_constant=_reject_constant)
+    except json.JSONDecodeError as exc:
+        return None, "invalid JSON: %s (column %d)" % (exc.msg, exc.colno)
+    except RecursionError:
+        return None, ("invalid JSON: value is nested too deeply "
+                      "(limit %d levels)" % MAX_JSON_DEPTH)
+    except ValueError as exc:
+        return None, "invalid JSON: %s" % (exc,)
+    if _json_depth(value) > MAX_JSON_DEPTH:
+        return None, ("invalid JSON: value is nested too deeply "
+                      "(limit %d levels)" % MAX_JSON_DEPTH)
+    return value, None
+
+
+# ---------------------------------------------------------------------------
 # File loading — byte level, so BOM and encoding damage get line numbers
 # ---------------------------------------------------------------------------
 
@@ -349,6 +417,16 @@ def _check_chat(record, line_no, add):
                 # *string* is not.
                 add("error", line_no,
                     "%s (%s) has empty content" % (where, role))
+            if isinstance(content, list):
+                for k, part in enumerate(content):
+                    if isinstance(part, dict) and "text" in part \
+                            and not isinstance(part["text"], str):
+                        add("error", line_no,
+                            "%s (%s) content part %d has non-string "
+                            "'text': a JSON %s — a content part's "
+                            "'text' must be a string"
+                            % (where, role, k + 1,
+                               _json_type_name(part["text"])))
     if roles:
         if "user" not in roles:
             add("error", line_no, "conversation has no user message")
@@ -435,11 +513,9 @@ def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS, similarity=0.0):
         if not text.strip():
             add("warning", line_no, "empty line")
             continue
-        try:
-            record = json.loads(text)
-        except json.JSONDecodeError as exc:
-            add("error", line_no,
-                "invalid JSON: %s (column %d)" % (exc.msg, exc.colno))
+        record, parse_error = _parse_line(text)
+        if parse_error is not None:
+            add("error", line_no, parse_error)
             continue
         if not isinstance(record, dict):
             add("error", line_no,
@@ -466,7 +542,12 @@ def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS, similarity=0.0):
             _check_chat(record, line_no, add)
             for m in record.get("messages", []):
                 if isinstance(m, dict):
-                    role_counter[m.get("role", "?")] += 1
+                    role = m.get("role")
+                    # A non-string role is already an error (reported
+                    # by _check_chat); counting it must not crash —
+                    # list/dict roles are unhashable.
+                    role_counter[role if isinstance(role, str)
+                                 else "?"] += 1
         elif fmt == "prompt-completion":
             _check_prompt_completion(record, line_no, add)
         else:
@@ -591,9 +672,8 @@ def iter_records(path):
     for line_no, text, decode_error in lines:
         if decode_error is not None or not text or not text.strip():
             continue
-        try:
-            record = json.loads(text)
-        except json.JSONDecodeError:
+        record, parse_error = _parse_line(text)
+        if parse_error is not None:
             continue
         if isinstance(record, dict):
             raw = text[:-1] if text.endswith("\r") else text
@@ -616,9 +696,8 @@ def skipped_line_count(path):
             continue
         if not text.strip():
             continue
-        try:
-            record = json.loads(text)
-        except json.JSONDecodeError:
+        record, parse_error = _parse_line(text)
+        if parse_error is not None:
             skipped += 1
             continue
         if not isinstance(record, dict):
