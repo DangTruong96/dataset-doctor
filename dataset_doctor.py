@@ -31,7 +31,7 @@ import statistics
 import sys
 from collections import Counter
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 VALID_ROLES = ("system", "user", "assistant", "tool")
 DEFAULT_MAX_TOKENS = 4096
@@ -945,15 +945,24 @@ def cmd_leakage(args):
         for b_line, a_line in result["exact"][:20]:
             print("LEAK: %s line %d is an exact duplicate of %s line %d"
                   % (args.file_b, b_line, args.file_a, a_line))
+        if len(result["exact"]) > 20:
+            print("… and %d more exact leak(s) (see --json for the "
+                  "full list)" % (len(result["exact"]) - 20))
         for b_line, a_line in result["normalized_only"][:20]:
             print("LEAK: %s line %d matches %s line %d after "
                   "whitespace/case normalization"
                   % (args.file_b, b_line, args.file_a, a_line))
+        if len(result["normalized_only"]) > 20:
+            print("… and %d more normalized leak(s) (see --json for "
+                  "the full list)" % (len(result["normalized_only"]) - 20))
         for b_line, a_line, sim in result["similar"][:20]:
             print("LEAK: %s line %d is %.0f%% similar to %s line %d — "
                   "possible paraphrase leakage"
                   % (args.file_b, b_line, sim * 100,
                      args.file_a, a_line))
+        if len(result["similar"]) > 20:
+            print("… and %d more similar leak(s) (see --json for the "
+                  "full list)" % (len(result["similar"]) - 20))
         if total:
             print("leakage FAILED — %d example(s) appear in both files"
                   % total)

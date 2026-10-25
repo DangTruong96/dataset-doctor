@@ -4,6 +4,47 @@ All notable changes to DatasetDoctor are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [semantic versioning](https://semver.org/).
 
+## [0.2.3] - 2026-10-25
+
+### Fixed
+
+A documentation-vs-behavior and output-integrity QA round (replaying
+every README example verbatim, diffing text output against `--json`
+output, and re-running commands for identical results) found one defect
+in `leakage`'s text output. Behavior on files with 20 or fewer leaks
+per category is unchanged.
+
+- **`leakage` text output silently dropped leaks past the 20th per
+  category.** With 25 shared examples, only the first 20 `LEAK:` lines
+  were printed and nothing said lines were omitted — the total line
+  ("25 example(s) appear in both files") does not say *which* lines
+  were cut, so a user fixing leaks from text output alone would miss
+  the rest. This affected all three categories (exact, normalized-only,
+  similar). Each truncated category now prints an explicit disclosure
+  ("… and N more exact/normalized/similar leak(s) (see --json for the
+  full list)"), matching the disclosure `check`'s issue lists already
+  print ("… and N more errors"). The `--json` report was already
+  complete and is unchanged.
+
+### Verified, no change
+
+The same round verified against the README and left the code alone
+where behavior already matched: all captured README outputs reproduce
+exactly (`check` on good/messy/similar, `dedupe`, `split`, `leakage`
+with and without `--similarity`); text and `--json` reports agree on
+counts, token statistics, line numbers and exit codes; `dedupe` and
+`split` are byte-identical across repeat runs, splits are disjoint
+with union equal to the input, and `dedupe` keeps the first
+occurrence's original text; exit codes are 0/1/2 as documented
+(clean / problems / usage-or-I/O error). Two observations recorded
+without a code change: a 5,000-record heavily templated similarity
+check takes ~20 s in-process on this VM versus the README's "~6 s"
+(machine- and data-dependent estimate, and the result is correct);
+`split` uses round-half-even, so 10 examples at `--val-ratio 0.25`
+yields 2 validation examples (2.5 rounds to 2) — the ratio is
+approximate by nature at small sizes, and determinism/disjointness
+hold.
+
 ## [0.2.2] - 2026-10-23
 
 ### Fixed

@@ -508,6 +508,50 @@ class TestCliSimilarity(unittest.TestCase):
         self.assertEqual(len(payload["similar"]), 1)
         self.assertGreaterEqual(payload["similar"][0]["similarity"], 0.8)
 
+    def test_leakage_text_discloses_truncation_past_20(self):
+        # Text output lists only the first 20 leaks per category, so
+        # each truncated category must say how many more exist — the
+        # total line alone does not say which lines were omitted, and
+        # check's issue lists already disclose truncation this way.
+        def chat(i, user="Q%d", asst="A%d"):
+            def fmt(template):
+                return template % i if "%" in template else template
+            return json.dumps({"messages": [
+                {"role": "user", "content": fmt(user)},
+                {"role": "assistant", "content": fmt(asst)}]})
+        a = write_tmp(self, "\n".join(chat(i) for i in range(25)) + "\n")
+        b = write_tmp(self, "\n".join(chat(i) for i in range(25)) + "\n")
+        proc = self.run_cli("leakage", a, b)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout.count("LEAK:"), 20)
+        self.assertIn("… and 5 more exact leak(s)", proc.stdout)
+        b_norm = write_tmp(
+            self, "\n".join(chat(i, "q%d ", "a%d") for i in range(25))
+            + "\n")
+        proc = self.run_cli("leakage", a, b_norm)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout.count("LEAK:"), 20)
+        self.assertIn("… and 5 more normalized leak(s)", proc.stdout)
+        a_sim = write_tmp(
+            self, "\n".join(
+                chat(i, "How do I reset password for account %d",
+                     "Go to settings and click reset password today")
+                for i in range(25)) + "\n")
+        b_sim = write_tmp(
+            self, "\n".join(
+                chat(i, "How can I reset password for account %d",
+                     "Go to settings and click reset password today")
+                for i in range(25)) + "\n")
+        proc = self.run_cli("leakage", a_sim, b_sim, "--similarity", "0.8")
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout.count("LEAK:"), 20)
+        self.assertIn("… and 5 more similar leak(s)", proc.stdout)
+        # At or under the cap, no disclosure line appears.
+        small_a = write_tmp(self, "\n".join(chat(i) for i in range(3))
+                            + "\n")
+        proc = self.run_cli("leakage", small_a, small_a)
+        self.assertNotIn("more exact leak(s)", proc.stdout)
+
 
 class TestPromptCompletionMissingKeys(unittest.TestCase):
     """A record with only one of prompt/completion is a broken
