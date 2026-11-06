@@ -4,6 +4,81 @@ All notable changes to DatasetDoctor are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [semantic versioning](https://semver.org/).
 
+## [0.2.4] - 2026-11-06
+
+### Fixed
+
+A scale & performance and error-message-quality QA round (realistic
+large files, hostile inputs, and a 300-trial property test of the
+similarity pass against a brute-force oracle) found two defects.
+
+- **`check` failed valid files that start with an unrecognized
+  record.** A single generic line (e.g. a metadata record such as
+  `{"foo": "bar"}` at the top of the file) locked the file's format
+  to "generic", so every well-formed chat or prompt/completion
+  record after it was reported as a mixed-format error and the
+  check failed with exit code 1. A generic record has no format of
+  its own: it now keeps only its existing warning ("unrecognized
+  record shape — only JSON validity was checked") and neither locks
+  the file format nor counts as a format mismatch, in either
+  position. A file of only generic records still reports format
+  "generic"; a genuinely mixed chat + prompt/completion file still
+  fails with the mixed-format error.
+- **`check` / `leakage` with `--similarity` were quadratic on
+  duplicate-heavy and heavily templated files.** Each example's
+  candidate set was built by unioning every earlier example sharing
+  a prefix shingle, so a 20,000-line file of identical examples took
+  ~81 s to check (~5 s at 5,000 lines), a 20,000-line templated
+  file ~88 s, and `leakage --similarity` on two such 20,000-line
+  files ~246 s. Two changes in `similar_pairs`: candidates are now
+  visited lazily in position order (a merge of the per-shingle
+  position lists) so a scan stops at the first similar earlier
+  example without materializing the whole candidate set, and an
+  example that duplicates an already-indexed example of its own
+  duplicate cluster (identical shingle set) is not indexed at all —
+  it can never be any later example's earliest non-skipped similar
+  match. After the fix the same three cases take ~10 s / ~23 s /
+  ~14 s wall on this VM, down from ~81 s / ~88 s / ~246 s (the
+  remaining time is dominated by the pre-existing per-line
+  validation cost — profiling shows the similarity pass itself is no
+  longer the bottleneck), and doubling a duplicate-heavy input now
+  scales ~2x instead of ~4x.
+  `leakage` now also passes the normalized-hash groups into the
+  similarity pass, so its similar list no longer repeats a line
+  already reported as an exact/normalized leak via a duplicate line
+  in the other file (e.g. two 20,000-line identical files now report
+  1 leaked example instead of 20,001 — the same distinct example
+  counted 20,001 times). Genuine paraphrase leaks are unaffected:
+  full text and `--json` outputs on the bundled examples and on
+  5,000-line templated/identical files are byte-identical to v0.2.3
+  except for the two intended changes above.
+
+### Verified, no change
+
+The same round verified against the README and left the code alone
+where behavior already matched: the similarity pass agrees with a
+brute-force all-pairs oracle on 300 random trials, 200
+duplicate-heavy stress trials, and 300 leakage-shaped trials
+(cross-file reportable + normalized-hash groups); a lone-surrogate
+escape (`"\ud800"`) in chat content passes `check`, `dedupe`
+(stdout and `-o`), `split`, and `leakage --similarity` without
+errors; `dedupe -o` with the output path equal to the input is safe
+(the input is fully read before the output is opened); error paths
+(directory or missing input for every subcommand, `--similarity`
+outside (0, 1] including `nan`, negative `--max-tokens`,
+`--val-ratio` outside [0, 1], unwritable output path) all exit 2
+with a clean one-line message and no traceback; `split` with
+`--val-ratio 0` / `1` writes a truly empty side; `leakage` of a file
+against itself reports every line; stdin (`check -`) works. Two
+observations recorded without a code change: `split` with
+`--train-out` (or `--val-out`) equal to the input file overwrites
+the input with that side's subset — the user explicitly named the
+file as output, and only `--train-out` == `--val-out` is refused,
+so treat an output path equal to the input as intentional; `check`
+on an unreadable file prints "check FAILED" while exiting 2 (the
+I/O-error code) — the wording is loose but the exit code is the
+documented one.
+
 ## [0.2.3] - 2026-10-25
 
 ### Fixed

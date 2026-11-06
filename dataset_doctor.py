@@ -23,6 +23,7 @@ error.
 
 import argparse
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -31,7 +32,7 @@ import statistics
 import sys
 from collections import Counter
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 VALID_ROLES = ("system", "user", "assistant", "tool")
 DEFAULT_MAX_TOKENS = 4096
@@ -201,7 +202,17 @@ def similar_pairs(texts, threshold, skip_pairs=frozenset(),
     two sets can only reach t if the rarest-first prefixes of their
     shingle sets (length |A| - ceil(t*|A|) + 1) overlap, so only prefix
     sharers are ever compared in full. The filter is exact — it prunes
-    comparisons, never results.
+    comparisons, never results. Candidates are visited lazily in
+    position order (a merge of the per-shingle position lists), so a
+    scan usually stops at the first similar earlier doc without
+    materializing the whole candidate set; and a doc that duplicates
+    an already-indexed doc of its own skip-group (identical shingle
+    set) is not indexed at all — it can never be any later doc's
+    earliest non-skipped similar match, since the earlier group
+    member is earlier, equally similar to everything, and skipped
+    exactly where this doc would be skipped. Together these keep the
+    pass linear in distinct texts on duplicate-heavy and heavily
+    templated files instead of quadratic in lines.
     """
     docs = []
     doc_freq = Counter()
@@ -217,14 +228,26 @@ def similar_pairs(texts, threshold, skip_pairs=frozenset(),
             enumerate(sorted(doc_freq, key=lambda s: (doc_freq[s], s)))}
     index = {}
     pairs = []
+    # Shingle set of the first doc seen per skip-group label (only
+    # meaningful when skip_groups is given; without labels there is
+    # nothing to prove a doc redundant).
+    group_shingles = {}
     for pos, (key, shingles) in enumerate(docs):
         ordered = sorted(shingles, key=lambda s: rank[s])
         prefix_len = len(ordered) - math.ceil(threshold * len(ordered)) + 1
         prefix = ordered[:max(1, prefix_len)]
-        candidates = set()
-        for shingle in prefix:
-            candidates.update(index.get(shingle, ()))
-        for other_pos in sorted(candidates):
+        label = skip_groups.get(key) if skip_groups is not None else None
+        redundant = label is not None \
+            and group_shingles.get(label) == shingles
+        if label is not None and label not in group_shingles:
+            group_shingles[label] = shingles
+        streams = [index[shingle] for shingle in prefix
+                   if shingle in index]
+        last_pos = None
+        for other_pos in heapq.merge(*streams):
+            if other_pos == last_pos:
+                continue  # same doc reached via another prefix shingle
+            last_pos = other_pos
             other_key, other_shingles = docs[other_pos]
             if (other_key, key) in skip_pairs:
                 continue
@@ -244,8 +267,9 @@ def similar_pairs(texts, threshold, skip_pairs=frozenset(),
             if sim >= threshold:
                 pairs.append((other_key, key, sim))
                 break  # one report per later key: the earliest match
-        for shingle in prefix:
-            index.setdefault(shingle, []).append(pos)
+        if not redundant:
+            for shingle in prefix:
+                index.setdefault(shingle, []).append(pos)
     return pairs
 
 
@@ -529,7 +553,16 @@ def validate_file(path, max_tokens=DEFAULT_MAX_TOKENS, similarity=0.0):
         # with no error at all.
         before = len(report["errors"])
         fmt = detect_format(record)
-        if file_format is None:
+        if fmt == "generic":
+            # An unrecognized record has no format of its own: it gets
+            # its own warning below and neither locks the file's format
+            # nor counts as a format mismatch — otherwise one stray
+            # line (a metadata record at the top, say) turns every
+            # well-formed record after it into a spurious mixed-format
+            # error.
+            if file_format is None:
+                report["format"] = "generic"
+        elif file_format is None:
             file_format = fmt
             report["format"] = fmt
         elif fmt != file_format:
@@ -765,14 +798,16 @@ def leakage_report(path_a, path_b, similarity=0.0):
     if similarity and similarity > 0:
         known = {(("a", a_line), ("b", b_line))
                  for b_line, a_line in exact_overlap + norm_overlap}
-        texts = [(("a", line_no), record_text(record))
-                 for line_no, _raw, record in iter_records(path_a)]
-        texts += [(("b", line_no), record_text(record))
-                  for line_no, _raw, record in iter_records(path_b)]
+        texts = []
+        groups = {}
+        for tag, path in (("a", path_a), ("b", path_b)):
+            for line_no, _raw, record in iter_records(path):
+                texts.append(((tag, line_no), record_text(record)))
+                groups[(tag, line_no)] = normalized_hash(record)
         cross_file = lambda key_a, key_b: key_a[0] != key_b[0]  # noqa: E731
         for key_a, key_b, sim in similar_pairs(
                 texts, similarity, skip_pairs=known,
-                reportable=cross_file):
+                skip_groups=groups, reportable=cross_file):
             # a-records precede b-records in `texts`, so a cross pair
             # always arrives as (a_key, b_key)
             result["similar"].append((key_b[1], key_a[1], sim))

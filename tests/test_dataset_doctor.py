@@ -845,5 +845,139 @@ class TestAdversarialRound2(unittest.TestCase):
             self.assertIn(proc.returncode, (0, 1, 2), argv)
 
 
+class TestQaRound2FormatAndScale(unittest.TestCase):
+    """Round-2 QA (scale & performance + error-message quality +
+    realistic-flow angle): a generic record must not poison format
+    detection, and the --similarity pass must stay linear on
+    duplicate-heavy and heavily templated files."""
+
+    def test_generic_record_does_not_lock_file_format(self):
+        path = write_tmp(self, '{"foo": "bar"}\n' + CHAT + "\n"
+                         + CHAT + "\n")
+        report = dd.validate_file(path)
+        self.assertEqual(report["format"], "chat")
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["valid"], 3)
+
+    def test_generic_record_after_chat_is_warning_only(self):
+        path = write_tmp(self, CHAT + '\n{"meta": 1}\n' + CHAT + "\n")
+        report = dd.validate_file(path)
+        self.assertEqual(report["format"], "chat")
+        self.assertEqual(report["errors"], [])
+        msgs = [w["message"] for w in report["warnings"]]
+        self.assertTrue(any("unrecognized record shape" in m
+                            for m in msgs))
+
+    def test_all_generic_file_reports_generic_format(self):
+        path = write_tmp(self, '{"foo": 1}\n{"bar": 2}\n')
+        report = dd.validate_file(path)
+        self.assertEqual(report["format"], "generic")
+        self.assertEqual(report["errors"], [])
+
+    def test_generic_then_prompt_completion_locks_prompt_completion(self):
+        path = write_tmp(self, '{"foo": 1}\n'
+                         '{"prompt": "q", "completion": "a"}\n')
+        report = dd.validate_file(path)
+        self.assertEqual(report["format"], "prompt-completion")
+        self.assertEqual(report["errors"], [])
+
+    def test_chat_then_prompt_completion_still_mixed_format(self):
+        path = write_tmp(self, CHAT + "\n"
+                         '{"prompt": "q", "completion": "a"}\n')
+        report = dd.validate_file(path)
+        self.assertTrue(any("differs from the file's format" in m
+                            for m in error_messages(report)))
+
+    def test_similar_pairs_matches_brute_force_on_duplicate_heavy_input(self):
+        # Guards the prefix-index optimizations (lazy candidate merge
+        # + not indexing duplicate-cluster members): results must
+        # equal a brute-force all-pairs oracle even when most texts
+        # are exact duplicates of each other.
+        import random
+        rng = random.Random(20261106)
+        words = ["alpha", "beta", "gamma", "delta", "hello", "world"]
+        base = " ".join(rng.choice(words) for _ in range(12))
+        texts, groups = [], {}
+        for i in range(60):
+            r = rng.random()
+            if r < 0.5:
+                text, label = base, "dup"
+            elif r < 0.7:
+                text, label = base + " " + rng.choice(words), "near"
+            else:
+                text, label = (" ".join(rng.choice(words)
+                                        for _ in range(12)), None)
+            texts.append((i, text))
+            groups[i] = label
+        skip_pairs = frozenset({(0, 1)})
+
+        def brute_force(texts, threshold, skip_pairs, skip_groups):
+            docs = [(k, dd.text_shingles(t)) for k, t in texts
+                    if dd.text_shingles(t)]
+            out = []
+            for i, (k, s) in enumerate(docs):
+                for j in range(i):
+                    ok, other = docs[j]
+                    if (ok, k) in skip_pairs:
+                        continue
+                    if skip_groups.get(ok) is not None \
+                            and skip_groups.get(ok) \
+                            == skip_groups.get(k):
+                        continue
+                    if dd.jaccard_similarity(other, s) >= threshold:
+                        out.append((ok, k,
+                                    dd.jaccard_similarity(other, s)))
+                        break
+            return out
+
+        for threshold in (0.7, 0.8, 0.9):
+            got = dd.similar_pairs(texts, threshold,
+                                   skip_pairs=skip_pairs,
+                                   skip_groups=groups)
+            self.assertEqual(
+                got, brute_force(texts, threshold, skip_pairs, groups))
+
+    def test_leakage_similar_list_does_not_repeat_exact_leak(self):
+        # File A holds the example twice, file B once: the shared
+        # example is reported once, as exact — not once more as
+        # "similar" via the duplicate A line.
+        a = write_tmp(self, CHAT + "\n" + CHAT + "\n")
+        b = write_tmp(self, CHAT + "\n")
+        result = dd.leakage_report(a, b, similarity=0.8)
+        self.assertEqual(len(result["exact"]), 1)
+        self.assertEqual(result["similar"], [])
+        result = dd.leakage_report(b, a, similarity=0.8)
+        self.assertEqual(len(result["exact"]), 1)
+        self.assertEqual(result["similar"], [])
+
+    def test_similarity_pass_scales_linearly_on_duplicate_heavy_file(self):
+        # The old candidate-set construction made this quadratic:
+        # doubling the file quadrupled the time. The pass is now
+        # linear, so doubling must stay well under 3x. Timings are
+        # taken twice and the faster run wins, to smooth out
+        # scheduling noise on shared machines.
+        import time
+        texts = [(i, "What is the capital of France? "
+                  "Paris is the capital of France.") for i in range(6000)]
+        groups = {i: "dup" for i, _t in texts}
+
+        def timed(n):
+            best = None
+            for _ in range(2):
+                start = time.monotonic()
+                dd.similar_pairs(texts[:n], 0.8, skip_groups=groups)
+                elapsed = time.monotonic() - start
+                best = elapsed if best is None else min(best, elapsed)
+            return best
+
+        small = timed(3000)
+        big = timed(6000)
+        self.assertLess(big, 3.0 * small,
+                        "similarity pass scaled %.2fx when doubling "
+                        "3000 -> 6000 duplicate texts (%.2fs -> %.2fs); "
+                        "expected linear scaling" % (big / small, small,
+                                                     big))
+
+
 if __name__ == "__main__":
     unittest.main()
